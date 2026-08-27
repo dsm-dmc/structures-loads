@@ -391,41 +391,69 @@ def assign_sections(df, sections, config, vehicle=None):
     for eff_set, col, scope in partitions:
         if not len(eff_set):
             continue
-        first = eff_set.groupby("comp_key")["sta_lo"].min().to_dict()
-        for r in eff_set.itertuples(index=False):
-            sta = station_of(body, r.sta_dir)
-            lo = (sta >= r.sta_lo if abs(r.sta_lo - first[r.comp_key]) < 1e-9
-                  else sta > r.sta_lo)
-            in_range = lo & (sta <= r.sta_hi)
-            sel = (in_range if scope == "vehicle"
-                   else (body["comp_key"] == r.comp_key).to_numpy() & in_range)
-            clash = sel & body[col].notna().to_numpy()
-            if clash.any():
-                other = list(pd.unique(body.loc[clash, col])[:3])
-                raise ValueError(f"config '{config}': {scope} section "
-                                 f"'{r.section_id}' overlaps {other} on "
-                                 f"{int(clash.sum())} node(s)")
-            body.loc[sel, col] = r.section_id
+        assigned = np.full(len(body), None, dtype=object)
+        # The station array and the component mask are the same for every
+        # section of a component, so they are built once per component rather
+        # than once per section.
+        for ck, g in eff_set.groupby("comp_key"):
+            sta = station_of(body, g["sta_dir"].iloc[0])
+            scope_mask = (np.ones(len(body), bool) if scope == "vehicle"
+                          else (body["comp_key"] == ck).to_numpy())
+            first = g["sta_lo"].min()
+            for r in g.itertuples(index=False):
+                lo = (sta >= r.sta_lo if abs(r.sta_lo - first) < 1e-9
+                      else sta > r.sta_lo)
+                sel = scope_mask & lo & (sta <= r.sta_hi)
+                clash = sel & (assigned != None)          # noqa: E711
+                if clash.any():
+                    other = list(pd.unique(assigned[clash])[:3])
+                    raise ValueError(f"config '{config}': {scope} section "
+                                     f"'{r.section_id}' overlaps {other} on "
+                                     f"{int(clash.sum())} node(s)")
+                assigned[sel] = r.section_id
+        body[col] = assigned
     return body
+
+
+def _grouped_resultants(body, col, loadcases):
+    """Sums F and the moment about the ORIGIN for each (loadcase, id) group.
+
+    One pass over the body rather than a boolean scan per section per case.
+    Moments are linear in the reference point, so the moment about any centroid
+    follows from the origin sum and the force sum:
+
+        M_c = M_0 - c x F
+    """
+    g = body[body[col].notna() & body["loadcase"].isin(loadcases)]
+    if g.empty:
+        return {}
+    F = g[FCOLS].to_numpy(float)
+    M0 = np.cross(g[XCOLS].to_numpy(float), F)
+    acc = pd.DataFrame(
+        {"loadcase": g["loadcase"].to_numpy(), "sid": g[col].to_numpy(),
+         "fx": F[:, 0], "fy": F[:, 1], "fz": F[:, 2],
+         "mx": M0[:, 0], "my": M0[:, 1], "mz": M0[:, 2], "n": 1})
+    tot = acc.groupby(["loadcase", "sid"], sort=False).sum()
+    return {k: (v[:3], v[3:6], int(v[6]))
+            for k, v in zip(tot.index, tot.to_numpy(float))}
 
 
 def section_loads(body, sections, config, loadcases, vehicle=None):
     """Six-component load at each section centroid, tagged by partition."""
     eff = effective_sections(sections, config)
     vkey = norm(vehicle) if vehicle else None
+    sums = {c: _grouped_resultants(body, c, loadcases)
+            for c in ("section_id", "vehicle_id") if c in body.columns}
+
     rows = []
     for r in eff.itertuples(index=False):
         cen = np.array([r.cen_x, r.cen_y, r.cen_z], float)
         is_veh = r.comp_key == vkey
         col = "vehicle_id" if is_veh else "section_id"
         for lc in loadcases:
-            s = body[(body["loadcase"] == lc) & (body[col] == r.section_id)]
-            if s.empty:
-                F = M = np.zeros(3)
-            else:
-                Fn = s[FCOLS].to_numpy(float)
-                F = Fn.sum(axis=0)
-                M = np.cross(s[XCOLS].to_numpy(float) - cen, Fn).sum(axis=0)
+            F, M0, n = sums.get(col, {}).get((lc, r.section_id),
+                                             (np.zeros(3), np.zeros(3), 0))
+            M = M0 - np.cross(cen, F)
             rows.append({"loadcase": lc, "partition": "vehicle" if is_veh
                          else "component", "configuration": r.configuration,
                          "component": r.component,
@@ -433,7 +461,7 @@ def section_loads(body, sections, config, loadcases, vehicle=None):
                          "sta_dir": r.sta_dir, "lat_dir": r.lat_dir,
                          "sta_lo": r.sta_lo,
                          "sta_hi": r.sta_hi, "cen_x": cen[0], "cen_y": cen[1],
-                         "cen_z": cen[2], "n_nodes": len(s),
+                         "cen_z": cen[2], "n_nodes": n,
                          "Fx": F[0], "Fy": F[1], "Fz": F[2],
                          "Mx": M[0], "My": M[1], "Mz": M[2]})
     return pd.DataFrame(rows)

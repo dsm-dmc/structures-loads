@@ -110,20 +110,29 @@ def test_card_folders_agree_with_the_sheet(loaded):
     assert out["agree"].all(), f"\n{out[~out['agree']].to_string(index=False)}"
 
 
-def test_geometry_is_identical_across_load_cases(loaded):
-    """A node cannot move between cases; geometry does not depend on load."""
+def test_geometry_is_identical_within_a_configuration(loaded):
+    """Geometry may differ BETWEEN configurations -- a deployed fin moves, the
+    model changes. Within one configuration a node must not move, since the
+    same grid is being loaded by different cases."""
     _, _, _, _, df = loaded
-    spread = df.groupby("node_id")[XCOLS].agg(lambda s: s.max() - s.min())
     extent = float(np.ptp(df[XCOLS].to_numpy(float), axis=0).max())
-    moved = spread[(spread > 1e-6 * extent).any(axis=1)]
-    assert moved.empty, f"{len(moved)} node(s) move between cases"
+    for cfg, g in df.groupby("config_folder"):
+        agg = g.groupby("node_id")[XCOLS].agg(["min", "max"])
+        spread = pd.DataFrame(
+            {c: agg[(c, "max")] - agg[(c, "min")] for c in XCOLS})
+        moved = spread[(spread > 1e-6 * extent).any(axis=1)]
+        assert moved.empty, (
+            f"{cfg}: {len(moved)} node(s) move between cases, worst "
+            f"{spread.to_numpy().max():.4g}\n"
+            f"{moved.head().to_string()}")
 
 
-def test_node_sets_are_identical_across_load_cases(loaded):
+def test_node_sets_are_identical_within_a_configuration(loaded):
     """Enveloping across cases with different node sets is not meaningful."""
     _, _, _, _, df = loaded
-    sizes = df.groupby("loadcase")["node_id"].nunique()
-    assert sizes.nunique() == 1, f"\n{sizes.to_string()}"
+    for cfg, g in df.groupby("config_folder"):
+        sizes = g.groupby("loadcase")["node_id"].nunique()
+        assert sizes.nunique() == 1, f"{cfg}:\n{sizes.to_string()}"
 
 
 # --------------------------------------------------- nothing is lost ---------
