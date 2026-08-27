@@ -1,0 +1,5 @@
+.venv
+*__pycache__*
+
+data/CC_Force_Cards/
+data/FF_Force_Cards/
