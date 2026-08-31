@@ -24,7 +24,7 @@ from section_loads import (
     read_force_cards, read_tables, run_sections, section_loads, section_nodes,
     station_of, tag_components, transfer,
     station_diagram, station_drivers, station_axes, station_columns,
-    plot_all_station_diagrams, ROLES,
+    plot_all_station_diagrams, panel_drivers, plot_station_diagram, ROLES,
     plot_station_diagram)
 
 CG = np.array([50.0, 0.0, 0.0])
@@ -949,3 +949,72 @@ def test_apply_exclusions_is_a_no_op_without_the_column():
     lcs = cases_frame([("LC1", "CC")]).drop(columns=[], errors="ignore")
     out, rep = apply_exclusions(df, lcs)
     assert len(out) == len(df) and rep.empty
+
+
+def many_case_diagram(n_cases=20):
+    sec = sections_frame([
+        ("Fuselage", "ALL", "a", "F1", "x", 0.0, 20.0, 10.0, 0.0, 0.0),
+        ("Fuselage", "ALL", "b", "F2", "x", 20.0, 40.0, 30.0, 0.0, 0.0)])
+    frames = []
+    for i in range(n_cases):
+        d = nodes_frame([10.0, 30.0], loadcase=f"LC{300 + i}", fz=1.0 + i)
+        frames.append(d)
+    df = pd.concat(frames, ignore_index=True)
+    cases = cases_frame([(f"LC{300 + i}", "CC") for i in range(n_cases)])
+    out, _ = run_sections(df, sec, cases)
+    return station_diagram(out)
+
+
+def test_panel_drivers_pick_the_extremes():
+    d = many_case_diagram(6)
+    lead = panel_drivers(d, "Fz", n=2)
+    assert "LC305" in lead          # largest fz
+    assert "LC300" in lead          # smallest
+
+
+def test_panel_drivers_returns_every_envelope_case_by_default():
+    """Whoever is max or min at any station, so the set can differ per panel
+    and per station -- the nose driver is not always the tail driver."""
+    d = many_case_diagram(6)
+    lead = set(panel_drivers(d, "Fz"))
+    for _, g in d.groupby("station"):
+        assert g.loc[g["Fz"].idxmax(), "loadcase"] in lead
+        assert g.loc[g["Fz"].idxmin(), "loadcase"] in lead
+
+
+def test_drivers_cap_limits_the_list():
+    d = many_case_diagram(6)
+    assert len(panel_drivers(d, "Fz", n=1)) == 1
+
+
+def test_plot_names_only_the_driving_cases(tmp_path):
+    """With many cases a per-case legend is unreadable, so only the extremes
+    are labelled."""
+    import matplotlib
+    matplotlib.use("Agg")
+    fig = plot_station_diagram(many_case_diagram(20), "Fuselage",
+                               out_dir=tmp_path, drivers=3)
+    labelled = {t.get_text() for ax in fig.axes for t in
+                (ax.get_legend().get_texts() if ax.get_legend() else [])}
+    assert 0 < len(labelled) <= 6
+    assert (tmp_path / "stations_fuselage_all.png").exists()
+
+
+def test_highlight_overrides_the_automatic_pick(tmp_path):
+    import matplotlib
+    matplotlib.use("Agg")
+    fig = plot_station_diagram(many_case_diagram(20), "Fuselage",
+                               highlight=["LC307"], out_dir=tmp_path)
+    labelled = {t.get_text() for ax in fig.axes for t in
+                (ax.get_legend().get_texts() if ax.get_legend() else [])}
+    assert labelled == {"LC307"}
+
+
+def test_negligible_panels_are_marked(tmp_path):
+    """A panel at 1e-13 against another at 1e5 is round-off, not load."""
+    import matplotlib
+    matplotlib.use("Agg")
+    fig = plot_station_diagram(many_case_diagram(5), "Fuselage",
+                               out_dir=tmp_path)
+    titles = [ax.get_title() for ax in fig.axes]
+    assert any("(~0)" in t for t in titles), titles

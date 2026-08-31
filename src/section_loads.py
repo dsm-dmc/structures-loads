@@ -115,7 +115,7 @@ def canon_headers(frame):
 
 
 def read_tables(table_dir):
-    """Reads and validates the four CSVs."""
+    """Reads and validates the f CSVs."""
     d = Path(table_dir)
     # index_col=False and skipinitialspace matter here: without them a row with
     # more fields than headers silently shifts every column into the next, and a
@@ -868,12 +868,33 @@ def station_columns(sta_dir, lat_dir):
             + [(_MOMENT[ax[r]], r) for r in ROLES])
 
 
+def panel_drivers(g, column, n=None):
+    """Cases that set the highest or lowest value at any station in a panel.
+
+    These are exactly the cases that touch the envelope. `n` caps the list,
+    keeping the ones that are extreme at the most stations; None returns all.
+    """
+    hi = g.loc[g.groupby("station")[column].idxmax(), "loadcase"]
+    lo = g.loc[g.groupby("station")[column].idxmin(), "loadcase"]
+    order = pd.concat([hi, lo]).value_counts().index.tolist()
+    return order if n is None else order[:n]
+
+
 def plot_station_diagram(diag, component, configuration=None, out_dir=None,
-                         highlight=None, figsize=(15, 7)):
+                         highlight=None, drivers=None, envelope=True,
+                         figsize=(15, 7)):
     """Six panels -- forces then moments, normal then lateral 1 then lateral 2.
 
-    One figure per component and configuration, since configurations use
-    different section grids and do not belong on shared axes.
+    With many load cases a per-case legend is unreadable, so every case is drawn
+    faint, the min/max envelope is shaded, and only the cases that set an
+    extreme are colored and named.
+
+    Args:
+        highlight: cases to color regardless. Overrides the automatic pick.
+        drivers: cap on how many envelope-touching cases to color. None
+            colors every case that is a maximum or minimum at any station,
+            which is the full set that defines the envelope.
+        envelope: shade between the minimum and maximum across cases.
     """
     import matplotlib.pyplot as plt
 
@@ -889,23 +910,47 @@ def plot_station_diagram(diag, component, configuration=None, out_dir=None,
             "plot one at a time")
 
     pairs = station_columns(g["sta_dir"].iloc[0], g["lat_dir"].iloc[0])
-    lead = None if highlight is None else {str(h) for h in highlight}
+    cases = sorted(g["loadcase"].unique())
+    forced = None if highlight is None else [str(h) for h in highlight]
+
+    # A panel whose values are negligible against the others is round-off, not
+    # load. Marked so an axis reading 1e-13 is not mistaken for a result.
+    biggest = max(float(np.abs(g[q].to_numpy(float)).max()) for q, _ in pairs)
     fig, axes = plt.subplots(2, 3, figsize=figsize, sharex=True)
     for ax, (q, role) in zip(axes.ravel(), pairs):
-        for lc in sorted(g["loadcase"].unique()):
+        scale = float(np.abs(g[q].to_numpy(float)).max())
+        negligible = scale < 1e-9 * max(biggest, 1e-30)
+        band = g.groupby("station")[q].agg(["min", "max"]).sort_index()
+        if envelope and len(cases) > 1:
+            ax.fill_between(band.index, band["min"], band["max"],
+                            color="0.85", zorder=0)
+        for lc in cases:
             d = g[g["loadcase"] == lc].sort_values("station")
-            on = lead is None or lc in lead
-            ax.plot(d["station"], d[q], marker="o", markersize=3,
-                    lw=2.0 if on else 0.8, alpha=1.0 if on else 0.3,
-                    label=lc if on else None)
-        ax.axhline(0, color="0.7", lw=0.8)
-        ax.set_title(f"{q}   {role}")
-        ax.grid(alpha=0.3)
+            ax.plot(d["station"], d[q], color="0.55", lw=0.5, alpha=0.5,
+                    zorder=1)
+        lead = forced if forced is not None else panel_drivers(g, q, drivers)
+        for lc in lead:
+            d = g[g["loadcase"] == lc].sort_values("station")
+            ax.plot(d["station"], d[q], lw=1.8, marker="o", markersize=3,
+                    label=lc, zorder=3)
+        ax.axhline(0, color="0.4", lw=0.8, zorder=2)
+        ax.set_title(f"{q}   {role}" + ("   (~0)" if negligible else ""),
+                     fontsize=10)
+        ax.grid(alpha=0.25)
+        if negligible:
+            ax.set_ylim(-1, 1)
+            ax.text(0.5, 0.5, "negligible", transform=ax.transAxes,
+                    ha="center", va="center", color="0.5", fontsize=9)
+        elif len(lead) > 1 or forced is not None:
+            ax.legend(fontsize=6, loc="best", framealpha=0.85,
+                      ncol=max(1, min(4, (len(lead) + 7) // 8)))
     for ax in axes[-1]:
         ax.set_xlabel("station")
-    axes[0, 0].legend(fontsize=8, ncol=2)
     cfg = g["configuration"].iloc[0]
-    fig.suptitle(f"{component} — {cfg}")
+    note = (f"{len(cases)} load cases; colored lines touch the envelope"
+            if forced is None else f"{len(cases)} load cases, highlighted: "
+            + ", ".join(forced))
+    fig.suptitle(f"{component} — {cfg}\n{note}", fontsize=11)
     fig.tight_layout()
     if out_dir is not None:
         out = Path(out_dir)
