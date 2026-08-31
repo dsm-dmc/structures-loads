@@ -19,6 +19,7 @@ Conventions:
 from __future__ import annotations
 
 import re
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -52,6 +53,41 @@ def norm_loadcase(value) -> str:
     return t if t.startswith("LC") else f"LC{t}"
 
 
+def parse_node_list(value) -> set:
+    """Parses a cell like "1000, 1001, 2000-2005" into a set of node ids.
+
+    Accepts commas, semicolons or spaces as separators and `a-b` for an
+    inclusive range. Blank or missing gives an empty set.
+    """
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return set()
+    # Quote characters can survive the CSV read when a cell was written as
+    # "1000, 1001" and the quoting was doubled or preceded by a space.
+    text = str(value).strip().strip("\"'").replace('"', " ").replace("'", " ")
+    text = text.strip()
+    if not text or text.lower() in ("nan", "none"):
+        return set()
+    out = set()
+    for tok in re.split(r"[,;\s]+", text):
+        if not tok:
+            continue
+        # A column holding a single number is read as float, so "9002" arrives
+        # as "9002.0".
+        tok = re.sub(r"^(\d+)\.0+$", r"\1", tok)
+        m = re.fullmatch(r"(\d+)\s*-\s*(\d+)", tok)
+        if m:
+            lo, hi = int(m.group(1)), int(m.group(2))
+            if hi < lo:
+                raise ValueError(f"node range '{tok}' is reversed")
+            out.update(range(lo, hi + 1))
+        elif re.fullmatch(r"\d+", tok):
+            out.add(int(tok))
+        else:
+            raise ValueError(f"'{tok}' in exclude_nodes is not a node id or "
+                             "an a-b range")
+    return out
+
+
 def parse_sta_dir(value) -> str:
     m = STA_DIR_RE.match(str(value))
     if not m:
@@ -81,10 +117,28 @@ def canon_headers(frame):
 def read_tables(table_dir):
     """Reads and validates the four CSVs."""
     d = Path(table_dir)
-    sections = canon_headers(pd.read_csv(d / "sections.csv"))
-    node_ranges = canon_headers(pd.read_csv(d / "node_ranges.csv"))
-    load_cases = canon_headers(pd.read_csv(d / "load_cases.csv"))
-    point_masses = canon_headers(pd.read_csv(d / "point_masses.csv"))
+    # index_col=False and skipinitialspace matter here: without them a row with
+    # more fields than headers silently shifts every column into the next, and a
+    # space before a quoted cell drops part of its contents.
+    def read(name):
+        with warnings.catch_warnings():
+            # A row with more fields than headers loses data. pandas only warns.
+            warnings.simplefilter("error", pd.errors.ParserWarning)
+            try:
+                raw = pd.read_csv(d / name, index_col=False,
+                                  skipinitialspace=True)
+            except pd.errors.ParserWarning as e:
+                raise ValueError(
+                    f"{name}: a row has more fields than the header, so data "
+                    "would be lost. A cell containing commas must be quoted, "
+                    'e.g. "1000, 1001". Semicolons or spaces avoid the issue '
+                    f"entirely.\n  pandas said: {e}") from None
+        return canon_headers(raw)
+
+    sections = read("sections.csv")
+    node_ranges = read("node_ranges.csv")
+    load_cases = read("load_cases.csv")
+    point_masses = read("point_masses.csv")
 
     for name, tbl, need in (
             ("sections", sections, SECTION_COLS),
@@ -101,6 +155,12 @@ def read_tables(table_dir):
     node_ranges["comp_key"] = node_ranges["item"].map(norm)
     load_cases["config"] = load_cases["configuration"].map(norm_config)
     load_cases["loadcase"] = load_cases["loadcase"].map(norm_loadcase)
+    # Optional: node ids a case is expected to be missing, so a legitimate
+    # difference between cases is declared rather than reported as a fault.
+    load_cases["exclude_nodes"] = (
+        load_cases["exclude_nodes"].map(parse_node_list)
+        if "exclude_nodes" in load_cases.columns
+        else [set() for _ in range(len(load_cases))])
 
     for tbl, keys, what in ((sections, ["section_id", "config"],
                              "section_id within a configuration"),
@@ -140,14 +200,24 @@ def read_tables(table_dir):
         raise ValueError("components mixing ALL with FF/CC sections:\n"
                          + "\n".join(f"  '{c}' declares {v}" for c, v in mixed))
 
-    nr = node_ranges.sort_values("gid_start").reset_index(drop=True)
-    for i in range(len(nr) - 1):
-        a, b = nr.iloc[i], nr.iloc[i + 1]
-        if b["gid_start"] <= a["gid_end"] and a["comp_key"] != b["comp_key"]:
-            raise ValueError(
-                f"GID ranges overlap: '{a['item']}' [{a['gid_start']}, "
-                f"{a['gid_end']}] and '{b['item']}' [{b['gid_start']}, "
-                f"{b['gid_end']}]")
+    # Several ranges per item is fine. Overlap between DIFFERENT items is not,
+    # because tagging is last-wins and would silently reassign nodes. Compared
+    # pairwise: an adjacent-only sweep misses a broad range overlapping a later
+    # one when a same-item row sits between them.
+    nr = node_ranges.reset_index(drop=True)
+    clashes = []
+    for i in range(len(nr)):
+        for j in range(i + 1, len(nr)):
+            a, b = nr.iloc[i], nr.iloc[j]
+            if (a["comp_key"] != b["comp_key"]
+                    and a["gid_start"] <= b["gid_end"]
+                    and b["gid_start"] <= a["gid_end"]):
+                clashes.append(
+                    f"'{a['item']}' [{a['gid_start']}, {a['gid_end']}] and "
+                    f"'{b['item']}' [{b['gid_start']}, {b['gid_end']}]")
+    if clashes:
+        raise ValueError("GID ranges overlap between different items:\n  "
+                         + "\n  ".join(clashes[:10]))
     return sections, node_ranges, load_cases, point_masses
 
 
@@ -351,30 +421,64 @@ def tag_components(df, node_ranges, exclude_items=frozenset()):
 
 def point_mass_loads(point_masses, load_cases, inertia_sign=-1.0,
                      accel_to_g=1.0):
-    """F = inertia_sign * mass * N, per point mass per load case."""
+    """F = inertia_sign * mass * N, per point mass per load case.
+
+    A node id listed in a case's exclude_nodes is dropped for that case, since
+    the exclusion covers point mass ids as well as card ids. The per-case mass
+    total is checked against the per-case sum, so a dropped mass cannot be
+    silently reapplied.
+    """
     pm = point_masses.copy()
     missing = [c for c in XCOLS if c not in pm.columns]
     if missing:
         raise KeyError(f"point_masses.csv missing {missing}")
 
     acc = load_cases.set_index("loadcase")[["nx", "ny", "nz"]] / accel_to_g
+    drops = (load_cases.set_index("loadcase")["exclude_nodes"].to_dict()
+             if "exclude_nodes" in load_cases.columns else {})
+
     out = []
     for lc, a in acc.iterrows():
-        g = pm.copy()
+        drop = drops.get(lc) or set()
+        g = pm[~pm["node_id"].isin(drop)].copy()
         g["loadcase"] = lc
         for col, ax in zip(FCOLS, ["nx", "ny", "nz"]):
             g[col] = inertia_sign * g["mass"] * a[ax]
         out.append(g)
     res = pd.concat(out, ignore_index=True)
 
-    total = pm["mass"].sum()
     for lc, a in acc.iterrows():
+        drop = drops.get(lc) or set()
+        total = pm.loc[~pm["node_id"].isin(drop), "mass"].sum()
         for col, ax in zip(FCOLS, ["nx", "ny", "nz"]):
             want = inertia_sign * total * a[ax]
             got = res.loc[res["loadcase"] == lc, col].sum()
             if abs(got - want) > 1e-9 * max(abs(want), 1.0):
                 raise AssertionError(f"{lc} {col}: {got} != {want}")
     return res
+
+
+def exclusion_report(df, point_masses, load_cases):
+    """What each case's exclude_nodes actually matched.
+
+    An id matching neither a card node nor a point mass does nothing, which is
+    usually a typo.
+    """
+    if "exclude_nodes" not in load_cases.columns:
+        return pd.DataFrame()
+    card_ids = set(df["node_id"])
+    pm_ids = set(point_masses["node_id"])
+    rows = []
+    for r in load_cases.itertuples(index=False):
+        drop = r.exclude_nodes or set()
+        present = set(df.loc[df["loadcase"] == r.loadcase, "node_id"])
+        rows.append({
+            "loadcase": r.loadcase, "declared": len(drop),
+            "matched_card": len(drop & card_ids),
+            "matched_point_mass": len(drop & pm_ids),
+            "still_present_in_cards": len(drop & present),
+            "unknown": sorted(drop - card_ids - pm_ids)[:12]})
+    return pd.DataFrame(rows)
 
 
 def assign_sections(df, sections, config, vehicle=None):
@@ -819,3 +923,42 @@ def plot_all_station_diagrams(diag, out_dir=None, highlight=None, **kw):
         figs[(comp, cfg)] = plot_station_diagram(
             diag, comp, cfg, out_dir=out_dir, highlight=highlight, **kw)
     return figs
+
+
+def configuration_report(df):
+    """Per configuration and load case: rows, unique nodes, and whether the
+    node set is the same across cases."""
+    rows = []
+    for cfg, g in df.groupby("config_folder"):
+        per = g.groupby("loadcase")["node_id"].agg(["size", "nunique"])
+        usual = int(per["nunique"].mode().iloc[0])
+        for lc, r in per.iterrows():
+            rows.append({"configuration": cfg, "loadcase": lc,
+                         "rows": int(r["size"]), "nodes": int(r["nunique"]),
+                         "vs_usual": int(r["nunique"]) - usual,
+                         "repeats": int(r["size"] - r["nunique"])})
+    return pd.DataFrame(rows).sort_values(["configuration", "loadcase"]
+                                          ).reset_index(drop=True)
+
+
+def scale_report(df, pm_loads):
+    """Card loads against point mass loads, per case.
+
+    Totals of absolute components, not maxima. A single point mass will exceed
+    a single grid point force by orders of magnitude, so only the totals are
+    comparable.
+    """
+    rows = []
+    for lc, g in df.groupby("loadcase"):
+        F = g[FCOLS].to_numpy(float)
+        p = pm_loads[pm_loads["loadcase"] == lc][FCOLS].to_numpy(float)
+        card_abs = float(np.abs(F).sum())
+        pm_abs = float(np.abs(p).sum()) if len(p) else 0.0
+        rows.append({"loadcase": lc, "nodes": g["node_id"].nunique(),
+                     "card_sum_abs": card_abs,
+                     "card_resultant": float(np.linalg.norm(F.sum(axis=0))),
+                     "card_max_node": float(np.abs(F).max()) if len(F) else 0.0,
+                     "pm_count": len(p), "pm_sum_abs": pm_abs,
+                     "pm_max": float(np.abs(p).max()) if len(p) else 0.0,
+                     "pm/card_totals": pm_abs / card_abs if card_abs else np.nan})
+    return pd.DataFrame(rows)

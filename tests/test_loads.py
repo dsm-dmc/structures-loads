@@ -19,7 +19,8 @@ from section_loads import (
     check_component_coverage, check_configurations, check_partitions_agree,
     check_sections_per_configuration, config_from_path, effective_sections,
     export_point_mass_loads, export_section_loads, force_audit,
-    loadcase_from_stem, norm, norm_loadcase, parse_sta_dir, point_mass_loads,
+    loadcase_from_stem, norm, norm_loadcase, parse_node_list, parse_sta_dir,
+    point_mass_loads, exclusion_report,
     read_force_cards, read_tables, run_sections, section_loads, section_nodes,
     station_of, tag_components, transfer,
     station_diagram, station_drivers, station_axes, station_columns,
@@ -746,3 +747,174 @@ def test_reversed_gid_range_is_caught():
                        "fx": 0.0, "fy": 0.0, "fz": 1.0, "loadcase": "LC1"})
     with pytest.raises(ValueError, match="gid_end < gid_start"):
         tag_components(df, rng)
+
+
+def ranges_csv(d, rows):
+    pd.DataFrame(rows, columns=["gid_start", "gid_end", "item"]).to_csv(
+        d / "node_ranges.csv", index=False)
+
+
+def test_several_ranges_per_component_are_allowed(tmp_path):
+    """An inboard/outboard split is a normal way to describe one component."""
+    sec = sections_frame([
+        ("Fuselage", "ALL", "a", "F1", "x", 0.0, 20.0, 10.0, 0.0, 0.0)])
+    write_tables(tmp_path, sec)
+    ranges_csv(tmp_path, [(1000, 1499, "Fuselage"), (1600, 1999, "Fuselage")])
+    _, nr, _, _ = read_tables(tmp_path)
+    assert len(nr) == 2 and set(nr["comp_key"]) == {"fuselage"}
+
+
+def test_overlap_hidden_by_a_same_component_row_is_caught(tmp_path):
+    """A broad range overlapping a later one, with a same-item row between.
+    An adjacent-pair sweep misses this; the nodes then go to whichever item
+    appears later in the file."""
+    sec = sections_frame([
+        ("Fuselage", "ALL", "a", "F1", "x", 0.0, 20.0, 10.0, 0.0, 0.0),
+        ("Tail Fin", "ALL", "b", "T1", "z", 0.0, 20.0, 0.0, 0.0, 10.0)])
+    write_tables(tmp_path, sec)
+    ranges_csv(tmp_path, [(1000, 9000, "Fuselage"), (2000, 2100, "Fuselage"),
+                          (8000, 8100, "Tail Fin")])
+    with pytest.raises(ValueError, match="Tail Fin"):
+        read_tables(tmp_path)
+
+
+def test_touching_ranges_of_different_components_are_caught(tmp_path):
+    """Shared endpoint: node 1999 would belong to both."""
+    sec = sections_frame([
+        ("Fuselage", "ALL", "a", "F1", "x", 0.0, 20.0, 10.0, 0.0, 0.0),
+        ("Tail Fin", "ALL", "b", "T1", "z", 0.0, 20.0, 0.0, 0.0, 10.0)])
+    write_tables(tmp_path, sec)
+    ranges_csv(tmp_path, [(1000, 1999, "Fuselage"), (1999, 2999, "Tail Fin")])
+    with pytest.raises(ValueError, match="overlap"):
+        read_tables(tmp_path)
+
+
+def test_nodes_split_across_two_ranges_of_one_component():
+    """Both ranges must land in the same component and bin normally."""
+    rng = pd.DataFrame({"gid_start": [1000, 1600], "gid_end": [1499, 1999],
+                        "item": "Fuselage", "comp_key": "fuselage"})
+    df = pd.DataFrame({"node_id": [1100, 1700], "x": [10.0, 30.0], "y": 0.0,
+                       "z": 0.0, "fx": 0.0, "fy": 0.0, "fz": 5.0,
+                       "loadcase": "LC1"})
+    out = tag_components(df, rng)
+    assert list(out["component"]) == ["Fuselage", "Fuselage"]
+    body = assign_sections(out, TWO_BAYS, "CC")
+    assert body["section_id"].tolist() == ["F1", "F2"]
+
+
+# ================== exclude_nodes ============================================
+
+@pytest.mark.parametrize("cell,expect", [
+    ("1000,1001", {1000, 1001}),
+    ("1000; 1001", {1000, 1001}),
+    ("1000 1001", {1000, 1001}),
+    ("2000-2003", {2000, 2001, 2002, 2003}),
+    ("1000, 2000-2002 3000", {1000, 2000, 2001, 2002, 3000}),
+    ("", set()), (None, set()), (float("nan"), set()),
+])
+def test_node_list_parsing(cell, expect):
+    assert parse_node_list(cell) == expect
+
+
+@pytest.mark.parametrize("bad", ["abc", "1000-990", "10.5"])
+def test_bad_node_list_raises(bad):
+    with pytest.raises(ValueError):
+        parse_node_list(bad)
+
+
+def test_exclude_nodes_column_is_optional(tmp_path):
+    sec = sections_frame([
+        ("Fuselage", "ALL", "a", "F1", "x", 0.0, 20.0, 10.0, 0.0, 0.0)])
+    write_tables(tmp_path, sec)
+    _, _, lcs, _ = read_tables(tmp_path)
+    assert list(lcs["exclude_nodes"]) == [set()]
+
+
+def test_exclude_nodes_column_is_parsed(tmp_path):
+    sec = sections_frame([
+        ("Fuselage", "ALL", "a", "F1", "x", 0.0, 20.0, 10.0, 0.0, 0.0)])
+    write_tables(tmp_path, sec)
+    lc = pd.read_csv(tmp_path / "load_cases.csv")
+    lc["exclude_nodes"] = "1000, 2000-2002"
+    lc.to_csv(tmp_path / "load_cases.csv", index=False)
+    _, _, lcs, _ = read_tables(tmp_path)
+    assert lcs["exclude_nodes"].iloc[0] == {1000, 2000, 2001, 2002}
+
+
+def test_exclude_nodes_drops_a_point_mass_for_that_case_only():
+    """The exclusion covers point mass ids as well as card ids."""
+    pm = pd.DataFrame({"node_id": [9001, 9002], "mass": [10.0, 40.0],
+                       "x": 0.0, "y": 0.0, "z": 0.0})
+    lcs = cases_frame([("LC1", "CC"), ("LC2", "CC")])
+    lcs["exclude_nodes"] = [{9002}, set()]
+    out = point_mass_loads(pm, lcs)
+    assert set(out.loc[out["loadcase"] == "LC1", "node_id"]) == {9001}
+    assert set(out.loc[out["loadcase"] == "LC2", "node_id"]) == {9001, 9002}
+    assert out.loc[out["loadcase"] == "LC1", "fz"].sum() == pytest.approx(-10.0)
+    assert out.loc[out["loadcase"] == "LC2", "fz"].sum() == pytest.approx(-50.0)
+
+
+def test_excluding_every_point_mass_gives_no_load():
+    pm = pd.DataFrame({"node_id": [9001], "mass": [10.0], "x": 0.0, "y": 0.0,
+                       "z": 0.0})
+    lcs = cases_frame([("LC1", "CC")])
+    lcs["exclude_nodes"] = [{9001}]
+    assert point_mass_loads(pm, lcs).empty
+
+
+@pytest.mark.parametrize("cell,expect", [
+    ("9002.0", {9002}), (9002.0, {9002}), ("1000.0, 2000-2002",
+                                           {1000, 2000, 2001, 2002})])
+def test_ids_read_as_float_are_accepted(cell, expect):
+    """A column holding one number is read as float, so 9002 arrives 9002.0."""
+    assert parse_node_list(cell) == expect
+
+
+def test_exclusion_report_flags_an_unknown_id():
+    df = pd.DataFrame({"node_id": [1000], "loadcase": "LC1", "x": 0.0,
+                       "y": 0.0, "z": 0.0, "fx": 0.0, "fy": 0.0, "fz": 1.0})
+    pm = pd.DataFrame({"node_id": [9001], "mass": [1.0]})
+    lcs = cases_frame([("LC1", "CC")])
+    lcs["exclude_nodes"] = [{1000, 9001, 12345}]
+    r = exclusion_report(df, pm, lcs).iloc[0]
+    assert r["matched_card"] == 1 and r["matched_point_mass"] == 1
+    assert r["unknown"] == [12345]
+
+
+# ================== CSV quoting ==============================================
+
+def write_cases(d, line):
+    for f in ("sections.csv", "node_ranges.csv", "point_masses.csv"):
+        pass
+    (d / "load_cases.csv").write_text(
+        "loadcase,configuration,nx,ny,nz,case_description,exclude_nodes\n"
+        + line + "\n")
+
+
+def tables_with_cases(tmp_path, line):
+    sec = sections_frame([
+        ("Fuselage", "ALL", "a", "F1", "x", 0.0, 20.0, 10.0, 0.0, 0.0)])
+    write_tables(tmp_path, sec)
+    write_cases(tmp_path, line)
+    return read_tables(tmp_path)
+
+
+@pytest.mark.parametrize("cell,expect", [
+    ('"46270, 46271"', {46270, 46271}),          # properly quoted
+    (' "46270, 46271"', {46270, 46271}),         # space before the quote
+    ('"""46270, 46271"""', {46270, 46271}),      # doubled by Excel
+    ("46270;46271", {46270, 46271}),             # semicolons, no quoting needed
+    ("46270 46271", {46270, 46271}),             # spaces
+    ("46270-46272", {46270, 46271, 46272}),      # range
+])
+def test_exclude_nodes_survives_csv_quoting(tmp_path, cell, expect):
+    """Quote characters can survive the read, and a space before the quote
+    changes how pandas parses the cell."""
+    _, _, lcs, _ = tables_with_cases(tmp_path, f"101,CC,0,0,1,a,{cell}")
+    assert lcs["exclude_nodes"].iloc[0] == expect
+
+
+def test_unquoted_comma_list_raises_rather_than_losing_data(tmp_path):
+    """More fields than headers shifts or drops columns; pandas only warns."""
+    with pytest.raises(ValueError, match="more fields than the header"):
+        tables_with_cases(tmp_path, "101,CC,0,0,1,a,46270, 46271")
