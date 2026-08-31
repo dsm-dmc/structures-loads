@@ -20,7 +20,7 @@ from section_loads import (
     check_sections_per_configuration, config_from_path, effective_sections,
     export_point_mass_loads, export_section_loads, force_audit,
     loadcase_from_stem, norm, norm_loadcase, parse_node_list, parse_sta_dir,
-    point_mass_loads, exclusion_report,
+    point_mass_loads, exclusion_report, apply_exclusions,
     read_force_cards, read_tables, run_sections, section_loads, section_nodes,
     station_of, tag_components, transfer,
     station_diagram, station_drivers, station_axes, station_columns,
@@ -918,3 +918,34 @@ def test_unquoted_comma_list_raises_rather_than_losing_data(tmp_path):
     """More fields than headers shifts or drops columns; pandas only warns."""
     with pytest.raises(ValueError, match="more fields than the header"):
         tables_with_cases(tmp_path, "101,CC,0,0,1,a,46270, 46271")
+
+
+def test_apply_exclusions_removes_card_rows_for_that_case_only():
+    df = pd.concat([nodes_frame([1.0, 2.0], loadcase="LC1"),
+                    nodes_frame([1.0, 2.0], loadcase="LC2")], ignore_index=True)
+    df["node_id"] = [1000, 1001, 1000, 1001]
+    lcs = cases_frame([("LC1", "CC"), ("LC2", "CC")])
+    lcs["exclude_nodes"] = [{1001}, set()]
+    out, rep = apply_exclusions(df, lcs)
+    assert sorted(out.loc[out["loadcase"] == "LC1", "node_id"]) == [1000]
+    assert sorted(out.loc[out["loadcase"] == "LC2", "node_id"]) == [1000, 1001]
+    r = rep.set_index("loadcase").loc["LC1"]
+    assert r["rows_removed"] == 1 and r["not_present"] == 0
+
+
+def test_apply_exclusions_counts_ids_that_were_not_there():
+    """A declared id absent from the cards is reported, not an error -- it may
+    be a point mass id, which point_mass_loads handles."""
+    df = nodes_frame([1.0]).assign(node_id=1000)
+    lcs = cases_frame([("LC1", "CC")])
+    lcs["exclude_nodes"] = [{1000, 9001}]
+    out, rep = apply_exclusions(df, lcs)
+    assert out.empty
+    assert rep["not_present"].iloc[0] == 1
+
+
+def test_apply_exclusions_is_a_no_op_without_the_column():
+    df = nodes_frame([1.0, 2.0])
+    lcs = cases_frame([("LC1", "CC")]).drop(columns=[], errors="ignore")
+    out, rep = apply_exclusions(df, lcs)
+    assert len(out) == len(df) and rep.empty

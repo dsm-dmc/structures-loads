@@ -962,3 +962,28 @@ def scale_report(df, pm_loads):
                      "pm_max": float(np.abs(p).max()) if len(p) else 0.0,
                      "pm/card_totals": pm_abs / card_abs if card_abs else np.nan})
     return pd.DataFrame(rows)
+
+
+def apply_exclusions(df, load_cases):
+    """Removes each case's exclude_nodes rows from the force cards.
+
+    Point masses are dropped by point_mass_loads from the same column, so after
+    this one declaration has removed a node from both paths.
+
+    Returns:
+        (df without those rows, a per-case report of what was removed).
+    """
+    if "exclude_nodes" not in load_cases.columns:
+        return df, pd.DataFrame()
+    drops = load_cases.set_index("loadcase")["exclude_nodes"].to_dict()
+    keep = np.ones(len(df), bool)
+    rows = []
+    for lc, g in df.groupby("loadcase"):
+        drop = drops.get(lc) or set()
+        hit = g["node_id"].isin(drop)
+        keep[g.index[hit]] = False
+        rows.append({"loadcase": lc, "declared": len(drop),
+                     "rows_removed": int(hit.sum()),
+                     "nodes_removed": int(g.loc[hit, "node_id"].nunique()),
+                     "not_present": len(drop - set(g["node_id"]))})
+    return df[keep].reset_index(drop=True), pd.DataFrame(rows)
