@@ -114,8 +114,31 @@ def canon_headers(frame):
     return out.dropna(how="all").reset_index(drop=True)
 
 
+def infer_vehicle(sections, node_ranges):
+    """The component whose sections span every node, not just its own.
+
+    It is the one in sections.csv with no GID range, since it owns no nodes of
+    its own. Derived rather than declared, so a name cannot be mistyped in two
+    places.
+
+    Returns:
+        The component name, or None if there is no such component.
+    """
+    sec = {norm(c): c for c in sections["component"]}
+    owned = {norm(i) for i in node_ranges["item"]}
+    spare = sorted(k for k in sec if k not in owned)
+    if not spare:
+        return None
+    if len(spare) > 1:
+        raise ValueError(
+            f"{[sec[k] for k in spare]} have sections but no GID range, so the "
+            "vehicle is ambiguous. Every component except the vehicle needs a "
+            "row in node_ranges.csv.")
+    return sec[spare[0]]
+
+
 def read_tables(table_dir):
-    """Reads and validates the f CSVs."""
+    """Reads and validates the four CSVs."""
     d = Path(table_dir)
     # index_col=False and skipinitialspace matter here: without them a row with
     # more fields than headers silently shifts every column into the next, and a
@@ -800,7 +823,7 @@ def station_diagram(sec, partition="component", direction="low"):
     for (part, lc, cfg, comp), g in use.groupby(
             ["partition", "loadcase", "configuration", "component"]):
         how = (direction.get(comp, "low") if isinstance(direction, dict)
-               else direction)
+               else (direction or "low"))
         if how not in ("low", "high"):
             raise ValueError(f"direction must be 'low' or 'high', got '{how}'")
         axis = parse_sta_dir(g["sta_dir"].iloc[0])
@@ -887,12 +910,12 @@ def plot_station_diagram(diag, component, configuration=None, out_dir=None,
 
     With many load cases a per-case legend is unreadable, so every case is drawn
     faint, the min/max envelope is shaded, and only the cases that set an
-    extreme are colored and named.
+    extreme are coloured and named.
 
     Args:
-        highlight: cases to color regardless. Overrides the automatic pick.
-        drivers: cap on how many envelope-touching cases to color. None
-            colors every case that is a maximum or minimum at any station,
+        highlight: cases to colour regardless. Overrides the automatic pick.
+        drivers: cap on how many envelope-touching cases to colour. None
+            colours every case that is a maximum or minimum at any station,
             which is the full set that defines the envelope.
         envelope: shade between the minimum and maximum across cases.
     """
@@ -947,7 +970,7 @@ def plot_station_diagram(diag, component, configuration=None, out_dir=None,
     for ax in axes[-1]:
         ax.set_xlabel("station")
     cfg = g["configuration"].iloc[0]
-    note = (f"{len(cases)} load cases; colored lines touch the envelope"
+    note = (f"{len(cases)} load cases; coloured lines touch the envelope"
             if forced is None else f"{len(cases)} load cases, highlighted: "
             + ", ".join(forced))
     fig.suptitle(f"{component} — {cfg}\n{note}", fontsize=11)

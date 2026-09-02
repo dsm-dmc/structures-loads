@@ -44,11 +44,25 @@ Six tabs across the top:
 | Breakdown | forces and moments about the vehicle CG |
 | Tests | press a button to check the code and your data |
 
-The sidebar on the left points at the data folder and holds the vehicle CG and
-unit settings. Change something, press **Run**.
+It works in three steps down the page: it reads the settings and tables, then
+you press **Read load files**, then **Run**. Nothing slow happens until you ask
+for it.
 
-To change the inputs, edit the CSV files in the `data` folder in Excel and press
-**Run**. The dashboard does not edit them.
+The sidebar holds the settings. The dropdowns are filled from your own tables,
+so you pick names rather than typing them:
+
+| setting | |
+|---|---|
+| Folder | where the data lives |
+| Vehicle component | the one whose sections span everything |
+| Items kept out of sections | normally the point masses |
+| Accumulate from the high station end | a wing runs from the tip |
+| Vehicle CG | three numbers |
+| Inertia sign, accel_to_g | leave these alone unless you know otherwise |
+| Only these load cases | blank runs everything |
+
+To change the inputs themselves, edit the CSV files in the `data` folder in
+Excel and press **Reload tables**. The dashboard does not edit them.
 
 ---
 
