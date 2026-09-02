@@ -10,6 +10,7 @@ Layers, in order:
     7  reporting and export
     8  station diagrams
 """
+import json
 import numpy as np
 import pandas as pd
 import pytest
