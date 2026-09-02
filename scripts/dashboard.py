@@ -69,7 +69,7 @@ with st.sidebar:
         default=[c for c in components if norm(c).endswith("lh")],
         help="A fuselage runs from the nose. A wing runs from the tip: high "
              "on positive y, low on negative y."))
-    cg_txt = st.text_input("Vehicle CG  x, y, z", "149, 0.0, 100")
+    cg_txt = st.text_input("Vehicle CG  x, y, z", "149.0, 0.0, 100")
     inertia_sign = st.selectbox("Inertia sign", [-1.0, 1.0])
     accel_to_g = st.number_input("accel_to_g", value=1.0, format="%.4f",
                                  help="386.09 only if nx/ny/nz are in in/s^2")
@@ -192,14 +192,18 @@ with tabs[1]:
     st.download_button("point_mass_loads.csv",
                        r["pm"].to_csv(index=False).encode(),
                        "point_mass_loads.csv")
+    st.markdown("**Point mass loads**")
+    st.dataframe(r["pm"], use_container_width=True, hide_index=True)
 
 with tabs[2]:
     diag = r["diag"]
-    pairs = diag[["component", "configuration"]].drop_duplicates()
-    labels = [f"{c} - {g}" for c, g in pairs.itertuples(index=False)]
-    pick = st.selectbox("Component", labels)
-    comp, conf = pick.rsplit(" - ", 1)
-    st.pyplot(plot_station_diagram(diag, comp, conf))
+    pairs = list(diag[["component", "configuration"]].drop_duplicates()
+                 .itertuples(index=False))
+    st.caption("Every case is drawn faint with the envelope shaded. Coloured "
+               "lines are the cases that set a maximum or minimum somewhere.")
+    for comp, conf in pairs:
+        st.markdown(f"**{comp} — {conf}**")
+        st.pyplot(plot_station_diagram(diag, comp, conf))
     st.markdown("**Drivers**")
     st.dataframe(r["drivers"], use_container_width=True, hide_index=True)
 

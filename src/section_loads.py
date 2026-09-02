@@ -460,11 +460,14 @@ def point_mass_loads(point_masses, load_cases, inertia_sign=-1.0,
     drops = (load_cases.set_index("loadcase")["exclude_nodes"].to_dict()
              if "exclude_nodes" in load_cases.columns else {})
 
+    configs = (load_cases.set_index("loadcase")["configuration"].to_dict()
+               if "configuration" in load_cases.columns else {})
     out = []
     for lc, a in acc.iterrows():
         drop = drops.get(lc) or set()
         g = pm[~pm["node_id"].isin(drop)].copy()
         g["loadcase"] = lc
+        g["configuration"] = configs.get(lc, "")
         for col, ax in zip(FCOLS, ["nx", "ny", "nz"]):
             g[col] = inertia_sign * g["mass"] * a[ax]
         out.append(g)
@@ -712,23 +715,32 @@ def cg_breakdown(sec, pm_loads, cg, pm_label="point masses"):
                                  **dict(zip(SIX, _sum_to(one, cg)))})
                 rows.append({"loadcase": lc, "partition": part, "_grp": 0,
                              "level": "subtotal", "component": comp,
-                             "section_id": "", "label": f"{comp} total",
+                             "section_id": None, "label": f"{comp} total",
                              "sta_lo": np.nan, "sta_hi": np.nan,
                              "n_nodes": gc["n_nodes"].sum(),
                              **dict(zip(SIX, _sum_to(gc, cg)))})
             for level, grp, vals in ((pm_label, 1, pm),
                                      ("TOTAL", 2, _sum_to(gp, cg) + pm)):
                 rows.append({"loadcase": lc, "partition": part, "_grp": grp,
-                             "level": level, "component": "", "section_id": "",
+                             "level": level, "component": "",
+                             "section_id": None,
                              "label": "", "sta_lo": np.nan, "sta_hi": np.nan,
                              "n_nodes": np.nan, **dict(zip(SIX, vals))})
 
     cols = ["loadcase", "partition", "level", "component", "section_id",
             "label", "sta_lo", "sta_hi", "n_nodes"] + SIX
-    return (pd.DataFrame(rows)
-            .sort_values(["loadcase", "partition", "_grp", "component",
-                          "sta_lo"], na_position="last")
-            .drop(columns="_grp")[cols].reset_index(drop=True))
+    out = (pd.DataFrame(rows)
+           .sort_values(["loadcase", "partition", "_grp", "component",
+                         "sta_lo"], na_position="last")
+           .drop(columns="_grp")[cols].reset_index(drop=True))
+    # The summary rows carry no section_id. None among integers would coerce the
+    # column to float and display 30000001 as 30000001.0, so use a nullable
+    # integer when the real ids are whole numbers.
+    real = out["section_id"].dropna()
+    if len(real) and pd.api.types.is_numeric_dtype(real) and (
+            real == real.astype("int64")).all():
+        out["section_id"] = out["section_id"].astype("Int64")
+    return out
 
 
 def force_audit(df, pm_loads, cg, sec=None):
@@ -783,15 +795,16 @@ def section_nodes(bodies, loadcase, section_id=None, partition="component"):
 
 def export_section_loads(sec, path):
     """Writes loadcase, section, ids, centroid and the six components."""
-    cols = ["loadcase", "partition", "component", "section_id", "label",
-            "cen_x", "cen_y", "cen_z"] + SIX
+    cols = ["loadcase", "configuration", "partition", "component",
+            "section_id", "label", "cen_x", "cen_y", "cen_z"] + SIX
     sec[cols].to_csv(path, index=False)
     return path
 
 
 def export_point_mass_loads(pm_loads, path):
     """Writes point mass locations and forces across the load cases."""
-    cols = ["loadcase", "node_id", "label", "mass"] + XCOLS + FCOLS
+    cols = ["loadcase", "configuration", "node_id", "label", "mass"] \
+        + XCOLS + FCOLS
     cols = [c for c in cols if c in pm_loads.columns]
     pm_loads[cols].to_csv(path, index=False)
     return path

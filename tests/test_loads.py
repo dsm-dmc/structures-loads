@@ -15,6 +15,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from pathlib import Path
+
 from section_loads import (
     FCOLS, SIX, XCOLS, assign_sections, bracket, canon_headers, cg_breakdown,
     check_component_coverage, check_configurations, check_partitions_agree,
@@ -1019,3 +1021,62 @@ def test_negligible_panels_are_marked(tmp_path):
                                out_dir=tmp_path)
     titles = [ax.get_title() for ax in fig.axes]
     assert any("(~0)" in t for t in titles), titles
+
+
+# ================== Arrow compatibility and export columns ===================
+
+def arrow_ok(frame):
+    """Streamlit serialises through pyarrow; a mixed-type object column fails."""
+    import pyarrow as pa
+    pa.Table.from_pandas(frame)
+
+
+@pytest.mark.parametrize("ids", [
+    "string",       # F1, F2 ...
+    "integer",      # 30000001 ...
+])
+def test_frames_serialise_to_arrow(ids):
+    """The summary rows of cg_breakdown carry no section_id. As "" that mixes
+    str with int and pyarrow refuses the column."""
+    sec = sections_frame([
+        ("Fuselage", "ALL", "a", "F1", "x", 0.0, 20.0, 10.0, 0.0, 0.0),
+        ("Fuselage", "ALL", "b", "F2", "x", 20.0, 40.0, 30.0, 0.0, 0.0)])
+    if ids == "integer":
+        sec["section_id"] = [30000001, 30000002]
+    body = assign_sections(nodes_frame([10.0, 30.0]), sec, "CC")
+    out = section_loads(body, sec, "CC", ["LC1"])
+    pm = pd.DataFrame(columns=["loadcase"] + XCOLS + FCOLS)
+    for frame in (out, cg_breakdown(out, pm, CG), station_diagram(out),
+                  force_audit(nodes_frame([10.0]).assign(excluded=False),
+                              pm, CG)):
+        arrow_ok(frame)
+
+
+def test_integer_section_ids_stay_integers():
+    """None among ints would coerce to float and show 30000001.0."""
+    sec = sections_frame([
+        ("Fuselage", "ALL", "a", "F1", "x", 0.0, 40.0, 20.0, 0.0, 0.0)])
+    sec["section_id"] = [30000001]
+    body = assign_sections(nodes_frame([10.0]), sec, "CC")
+    out = section_loads(body, sec, "CC", ["LC1"])
+    pm = pd.DataFrame(columns=["loadcase"] + XCOLS + FCOLS)
+    bd = cg_breakdown(out, pm, CG)
+    assert str(bd["section_id"].dtype) == "Int64"
+    assert bd["section_id"].dropna().iloc[0] == 30000001
+
+
+def test_exports_carry_the_configuration(tmp_path):
+    """So the CSVs can be filtered by CC or FF."""
+    secs = sections_frame([
+        ("Fuselage", "CC", "a", "F1", "x", 0.0, 40.0, 20.0, 0.0, 0.0)])
+    cases = cases_frame([("LC1", "CC")])
+    out, _ = run_sections(nodes_frame([10.0]), secs, cases)
+    pm = point_mass_loads(
+        pd.DataFrame({"node_id": [9001], "mass": [1.0], "x": [0.0],
+                      "y": [0.0], "z": [0.0]}), cases)
+    s_csv = pd.read_csv(export_section_loads(out, tmp_path / "s.csv"))
+    p_csv = pd.read_csv(export_point_mass_loads(pm, tmp_path / "p.csv"))
+    assert list(s_csv.columns)[:2] == ["loadcase", "configuration"]
+    assert list(p_csv.columns)[:2] == ["loadcase", "configuration"]
+    assert set(s_csv["configuration"]) == {"CC"}
+    assert set(p_csv["configuration"]) == {"CC"}
